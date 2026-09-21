@@ -1,0 +1,335 @@
+name: Release
+
+# Builds a tag of the private code repo (goldenxingxing/OpenKimo) and publishes
+# the installers here. It lives in this public repo because Actions minutes on
+# standard runners are free for public repos, while the private repo pays a
+# 10x multiplier on macOS runners.
+#
+# The source is checked out onto the ephemeral runner with SOURCE_TOKEN and
+# never leaves it — but this workflow file, its run logs, and any uploaded
+# artifacts ARE public. Do not print source files, and only upload what is
+# meant to be downloaded.
+#
+# Run it after pushing the tag to the code repo:
+#   gh workflow run release.yml -R goldenxingxing/OpenKimo-releases -f tag=v0.2.2
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: v* tag in goldenxingxing/OpenKimo to build and release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: goldenxingxing/OpenKimo
+  TAG: ${{ inputs.tag }}
+  GATEWAY_IMAGE: ghcr.io/goldenxingxing/kimi-agent-gateway
+  SANDBOX_IMAGE: ghcr.io/goldenxingxing/kimi-agent-sandbox
+
+jobs:
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Validate tag
+        run: |
+          [[ "$TAG" =~ ^v[0-9A-Za-z._-]+$ ]] || { echo "::error::tag must look like v1.2.3, got: $TAG"; exit 1; }
+
+      # Fail here, before any runner time is spent, if the tag is missing
+      # from the code repo or SOURCE_TOKEN cannot read it.
+      - name: Check tag exists in code repo
+        env:
+          GH_TOKEN: ${{ secrets.SOURCE_TOKEN }}
+        run: gh api "repos/$SOURCE_REPO/git/ref/tags/$TAG" --silent
+
+      # The single creator of the release. The image job and the three
+      # installer jobs all upload into it, so none of them races to create it.
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          body: |
+            ## Docker Images
+
+            Pull pre-built images (no local build required):
+
+            ```bash
+            docker pull ${{ env.GATEWAY_IMAGE }}:${{ inputs.tag }}
+            docker pull ${{ env.SANDBOX_IMAGE }}:${{ inputs.tag }}
+            ```
+
+            ## Quick Start
+
+            ```bash
+            # 1. Download config files
+            curl -O https://raw.githubusercontent.com/goldenxingxing/OpenKimo-releases/main/docker-compose.yml
+            curl -O https://raw.githubusercontent.com/goldenxingxing/OpenKimo-releases/main/.env.example
+            cp .env.example .env
+
+            # 2. Set your API key in .env
+            # 3. Start (pulls images automatically)
+            docker compose up -d
+            ```
+
+  images:
+    timeout-minutes: 90
+    name: Build & Push Images
+    needs: create-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io; each package must grant this repo Write under "Manage Actions access"
+
+    steps:
+      # ubuntu-latest runners ship with ~14GB free; two image builds plus
+      # buildx cache (mode=max) exhaust it. Pinned to a commit (tag v1.3.1):
+      # this job holds packages: write.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be
+
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push gateway
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.gateway
+          push: true
+          tags: |
+            ${{ env.GATEWAY_IMAGE }}:latest
+            ${{ env.GATEWAY_IMAGE }}:${{ inputs.tag }}
+          cache-from: type=gha,scope=gateway
+          cache-to: type=gha,mode=max,scope=gateway
+
+      - name: Prune gateway build cache
+        run: |
+          docker system prune -af
+          docker builder prune -af
+
+      - name: Build and push sandbox
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.sandbox
+          push: true
+          tags: |
+            ${{ env.SANDBOX_IMAGE }}:latest
+            ${{ env.SANDBOX_IMAGE }}:${{ inputs.tag }}
+          cache-from: type=gha,scope=sandbox
+          cache-to: type=gha,mode=max,scope=sandbox
+
+  build-macos:
+    timeout-minutes: 60
+    name: Build macOS DMG (${{ matrix.arch }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-latest
+            build_args: ''
+          - arch: x86_64
+            runner: macos-15-intel
+            build_args: --arch x86_64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write   # upload release assets
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install venvstacks uv
+
+      - name: Cache venvstacks layers
+        uses: actions/cache@v5
+        with:
+          path: |
+            packaging/.build
+            packaging/wheels
+          key: ${{ runner.os }}-${{ runner.arch }}-venvstacks-${{ hashFiles('packaging/venvstacks.toml', 'kimi-cli/uv.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-venvstacks-
+
+      - name: Build .app + DMG
+        run: |
+          cd packaging
+          python build.py ${{ matrix.build_args }} --version "${TAG#v}"
+
+      - name: Verify DMG was produced
+        run: |
+          ls -lh dist/*.dmg
+          test -n "$(ls dist/*.dmg 2>/dev/null)" || { echo '::error::No DMG found under dist/'; exit 1; }
+
+      # The exact dependency set this release resolved, with hashes (see the
+      # note in the code repo's packaging/). Public, like everything here.
+      - name: Upload resolved dependency locks
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: venvstacks-locks-${{ runner.arch }}
+          path: packaging/requirements/
+          if-no-files-found: warn
+
+      - name: Upload DMG to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/*.dmg
+          fail_on_unmatched_files: true
+
+  build-windows:
+    timeout-minutes: 60
+    name: Build Windows x64 installer
+    needs: create-release
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    env:
+      # build_windows.py prints non-ASCII; the default cp1252 stdout rejects it.
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js LTS
+        uses: actions/setup-node@v5
+        with:
+          node-version: 'lts/*'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install uv pyinstaller pillow pystray
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Cache packaging artifacts
+        uses: actions/cache@v5
+        with:
+          path: |
+            packaging/.cache
+            build/runtime-staging
+          key: ${{ runner.os }}-${{ runner.arch }}-winpkg-${{ hashFiles('packaging/requirements-windows.txt', 'packaging/build_windows.py') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-winpkg-
+
+      - name: Build installer .exe
+        shell: pwsh
+        run: |
+          $version = $env:TAG -replace '^v',''
+          cd packaging
+          python build_windows.py --version $version
+
+      - name: Verify installer was produced
+        shell: pwsh
+        run: |
+          Get-ChildItem dist-win/*.exe
+          if (-not (Get-ChildItem dist-win/*.exe -ErrorAction SilentlyContinue)) {
+            Write-Error "No .exe found under dist-win/"
+            exit 1
+          }
+
+      - name: Upload installer to Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist-win/*.exe
+          fail_on_unmatched_files: true
+
+  # Replaces the code repo's workflow_run-triggered sync-release job, which
+  # can no longer fire now that Release runs here.
+  sync-gitee:
+    name: Sync release to Gitee
+    needs: [images, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.tag }}
+          token: ${{ secrets.SOURCE_TOKEN }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Ensure Gitee release repo has an initial commit
+        env:
+          GITEE_ACCESS_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+        # Gitee refuses to create a release in an empty repository.
+        run: |
+          repo="qunwei/OpenKimo-releases"
+          branches=$(curl -sf "https://gitee.com/api/v5/repos/$repo/branches?access_token=$GITEE_ACCESS_TOKEN")
+          if [ "$branches" = "[]" ]; then
+            echo "Empty repo detected; creating README.md"
+            readme=$(printf '# OpenKimo Releases\n\nOpenKimo 安装包发布仓库，请在发行版页面下载。\n' | base64 -w0)
+            curl -sf -X POST "https://gitee.com/api/v5/repos/$repo/contents/README.md" \
+              --data-urlencode "access_token=$GITEE_ACCESS_TOKEN" \
+              --data-urlencode "content=$readme" \
+              --data-urlencode "message=docs: initialize releases repo" > /dev/null
+          fi
+
+      - name: Synchronize Gitee Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITEE_ACCESS_TOKEN: ${{ secrets.GITEE_ACCESS_TOKEN }}
+          RELEASE_SOURCE_REPOSITORY: goldenxingxing/OpenKimo-releases
+          GITEE_REPOSITORY: qunwei/OpenKimo-releases
+        run: python3 .github/scripts/sync_gitee_release.py --tag "$TAG"

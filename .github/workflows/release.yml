@@ -297,6 +297,12 @@ jobs:
   sync-gitee:
     name: Sync release to Gitee
     needs: [images, build-macos, build-windows]
+    # GITEE_ACCESS_TOKEN is not set in this repo's secrets (it lives on the
+    # private code repo), so this job has never succeeded here — but its
+    # failure marked every release run as failed and mailed the maintainers
+    # a spurious failure notification. Let it fail quietly until the token
+    # is provisioned; remove this once it is.
+    continue-on-error: true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
